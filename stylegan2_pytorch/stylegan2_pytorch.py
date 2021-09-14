@@ -42,15 +42,15 @@ try:
 except:
     APEX_AVAILABLE = False
 
+import actnn
 import aim
 
 assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
 
-
 # constants
 
 NUM_CORES = multiprocessing.cpu_count()
-EXTS = ['jpg', 'jpeg', 'png']
+EXTS = ['jpg', 'jpeg', 'png', 'JPEG']
 
 # helper classes
 
@@ -758,6 +758,18 @@ class StyleGAN2(nn.Module):
     def forward(self, x):
         return x
 
+shape_info = {}
+def pack_hook(input):
+    # print("=========PACK HOOK===========")
+    quantized = actnn.ops.quantize_activation(input, None)
+    shape_info[hash(quantized)] = input.shape
+    return quantized
+
+def unpack_hook(quantized):
+    # print("=========UNPACK HOOK===========")
+    input_shape = shape_info[hash(quantized)]
+    return actnn.ops.dequantize_activation(quantized, input_shape)
+
 class Trainer():
     def __init__(
         self,
@@ -772,7 +784,7 @@ class Trainer():
         batch_size = 4,
         mixed_prob = 0.9,
         gradient_accumulate_every=1,
-        lr = 2e-4,
+        lr = 2e-5,
         lr_mlp = 0.1,
         ttur_mult = 2,
         rel_disc_loss = False,
@@ -950,215 +962,216 @@ class Trainer():
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
 
     def train(self):
-        assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+            assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
 
-        if not exists(self.GAN):
-            self.init_GAN()
+            if not exists(self.GAN):
+                self.init_GAN()
+            
+            self.GAN.train()
+            total_disc_loss = torch.tensor(0.).cuda(self.rank)
+            total_gen_loss = torch.tensor(0.).cuda(self.rank)
 
-        self.GAN.train()
-        total_disc_loss = torch.tensor(0.).cuda(self.rank)
-        total_gen_loss = torch.tensor(0.).cuda(self.rank)
+            batch_size = math.ceil(self.batch_size / self.world_size)
 
-        batch_size = math.ceil(self.batch_size / self.world_size)
+            image_size = self.GAN.G.image_size
+            latent_dim = self.GAN.G.latent_dim
+            num_layers = self.GAN.G.num_layers
 
-        image_size = self.GAN.G.image_size
-        latent_dim = self.GAN.G.latent_dim
-        num_layers = self.GAN.G.num_layers
+            aug_prob   = self.aug_prob
+            aug_types  = self.aug_types
+            aug_kwargs = {'prob': aug_prob, 'types': aug_types}
 
-        aug_prob   = self.aug_prob
-        aug_types  = self.aug_types
-        aug_kwargs = {'prob': aug_prob, 'types': aug_types}
+            apply_gradient_penalty = self.steps % 4 == 0
+            apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
+            apply_cl_reg_to_generated = self.steps > 20000
 
-        apply_gradient_penalty = self.steps % 4 == 0
-        apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
-        apply_cl_reg_to_generated = self.steps > 20000
+            S = self.GAN.S if not self.is_ddp else self.S_ddp
+            G = self.GAN.G if not self.is_ddp else self.G_ddp
+            D = self.GAN.D if not self.is_ddp else self.D_ddp
+            D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
 
-        S = self.GAN.S if not self.is_ddp else self.S_ddp
-        G = self.GAN.G if not self.is_ddp else self.G_ddp
-        D = self.GAN.D if not self.is_ddp else self.D_ddp
-        D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
+            backwards = partial(loss_backwards, self.fp16)
 
-        backwards = partial(loss_backwards, self.fp16)
+            if exists(self.GAN.D_cl):
+                self.GAN.D_opt.zero_grad()
 
-        if exists(self.GAN.D_cl):
+                if apply_cl_reg_to_generated:
+                    for i in range(self.gradient_accumulate_every):
+                        get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+                        style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
+                        noise = image_noise(batch_size, image_size, device=self.rank)
+
+                        w_space = latent_to_w(self.GAN.S, style)
+                        w_styles = styles_def_to_tensor(w_space)
+
+                        generated_images = self.GAN.G(w_styles, noise)
+                        self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
+
+                for i in range(self.gradient_accumulate_every):
+                    image_batch = next(self.loader).cuda(self.rank)
+                    self.GAN.D_cl(image_batch, accumulate=True)
+
+                loss = self.GAN.D_cl.calculate_loss()
+                self.last_cr_loss = loss.clone().detach().item()
+                backwards(loss, self.GAN.D_opt, loss_id = 0)
+
+                self.GAN.D_opt.step()
+
+            # setup losses
+
+            if not self.dual_contrast_loss:
+                D_loss_fn = hinge_loss
+                G_loss_fn = gen_hinge_loss
+                G_requires_reals = False
+            else:
+                D_loss_fn = dual_contrastive_loss
+                G_loss_fn = dual_contrastive_loss
+                G_requires_reals = True
+            
+            # train discriminator
+
+            avg_pl_length = self.pl_mean
             self.GAN.D_opt.zero_grad()
 
-            if apply_cl_reg_to_generated:
-                for i in range(self.gradient_accumulate_every):
-                    get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-                    noise = image_noise(batch_size, image_size, device=self.rank)
+            for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]):
+                get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+                style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
+                noise = image_noise(batch_size, image_size, device=self.rank)
 
-                    w_space = latent_to_w(self.GAN.S, style)
-                    w_styles = styles_def_to_tensor(w_space)
+                w_space = latent_to_w(S, style)
+                w_styles = styles_def_to_tensor(w_space)
+                
+                generated_images = G(w_styles, noise)
+                fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
+          
 
-                    generated_images = self.GAN.G(w_styles, noise)
-                    self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
-
-            for i in range(self.gradient_accumulate_every):
                 image_batch = next(self.loader).cuda(self.rank)
-                self.GAN.D_cl(image_batch, accumulate=True)
+                image_batch.requires_grad_()
+                real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
 
-            loss = self.GAN.D_cl.calculate_loss()
-            self.last_cr_loss = loss.clone().detach().item()
-            backwards(loss, self.GAN.D_opt, loss_id = 0)
+                real_output_loss = real_output
+                fake_output_loss = fake_output
+                if self.rel_disc_loss:
+                    real_output_loss = real_output_loss - fake_output.mean()
+                    fake_output_loss = fake_output_loss - real_output.mean()
+
+                divergence = D_loss_fn(real_output_loss, fake_output_loss)
+                disc_loss = divergence
+
+                if self.has_fq:
+                    quantize_loss = (fake_q_loss + real_q_loss).mean()
+                    self.q_loss = float(quantize_loss.detach().item())
+
+                    disc_loss = disc_loss + quantize_loss
+
+                if apply_gradient_penalty:
+                    gp = gradient_penalty(image_batch, real_output)
+                    self.last_gp_loss = gp.clone().detach().item()
+                    self.track(self.last_gp_loss, 'GP')
+                    disc_loss = disc_loss + gp
+
+                disc_loss = disc_loss / self.gradient_accumulate_every
+                disc_loss.register_hook(raise_if_nan)
+                backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
+
+                total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
+
+            self.d_loss = float(total_disc_loss)
+            self.track(self.d_loss, 'D')
 
             self.GAN.D_opt.step()
 
-        # setup losses
+            # train generator
 
-        if not self.dual_contrast_loss:
-            D_loss_fn = hinge_loss
-            G_loss_fn = gen_hinge_loss
-            G_requires_reals = False
-        else:
-            D_loss_fn = dual_contrastive_loss
-            G_loss_fn = dual_contrastive_loss
-            G_requires_reals = True
+            self.GAN.G_opt.zero_grad()
 
-        # train discriminator
+            for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[S, G, D_aug]):
+                style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
+                noise = image_noise(batch_size, image_size, device=self.rank)
 
-        avg_pl_length = self.pl_mean
-        self.GAN.D_opt.zero_grad()
+                w_space = latent_to_w(S, style)
+                w_styles = styles_def_to_tensor(w_space)
 
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]):
-            get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-            style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-            noise = image_noise(batch_size, image_size, device=self.rank)
+                generated_images = G(w_styles, noise)
+                fake_output, _ = D_aug(generated_images, **aug_kwargs)
+                fake_output_loss = fake_output
 
-            w_space = latent_to_w(S, style)
-            w_styles = styles_def_to_tensor(w_space)
+                real_output = None
+                if G_requires_reals:
+                    image_batch = next(self.loader).cuda(self.rank)
+                    real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
+                    real_output = real_output.detach()
 
-            generated_images = G(w_styles, noise)
-            fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
+                if self.top_k_training:
+                    epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
+                    k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
+                    k = math.ceil(batch_size * k_frac)
 
-            image_batch = next(self.loader).cuda(self.rank)
-            image_batch.requires_grad_()
-            real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
+                    if k != batch_size:
+                        fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
 
-            real_output_loss = real_output
-            fake_output_loss = fake_output
+                loss = G_loss_fn(fake_output_loss, real_output)
+                gen_loss = loss
 
-            if self.rel_disc_loss:
-                real_output_loss = real_output_loss - fake_output.mean()
-                fake_output_loss = fake_output_loss - real_output.mean()
+                if apply_path_penalty:
+                    pl_lengths = calc_pl_lengths(w_styles, generated_images)
+                    avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
 
-            divergence = D_loss_fn(real_output_loss, fake_output_loss)
-            disc_loss = divergence
+                    if not is_empty(self.pl_mean):
+                        pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
+                        if not torch.isnan(pl_loss):
+                            gen_loss = gen_loss + pl_loss
 
-            if self.has_fq:
-                quantize_loss = (fake_q_loss + real_q_loss).mean()
-                self.q_loss = float(quantize_loss.detach().item())
+                gen_loss = gen_loss / self.gradient_accumulate_every
+                gen_loss.register_hook(raise_if_nan)
+                backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
 
-                disc_loss = disc_loss + quantize_loss
+                total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
 
-            if apply_gradient_penalty:
-                gp = gradient_penalty(image_batch, real_output)
-                self.last_gp_loss = gp.clone().detach().item()
-                self.track(self.last_gp_loss, 'GP')
-                disc_loss = disc_loss + gp
+            self.g_loss = float(total_gen_loss)
+            self.track(self.g_loss, 'G')
 
-            disc_loss = disc_loss / self.gradient_accumulate_every
-            disc_loss.register_hook(raise_if_nan)
-            backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
+            self.GAN.G_opt.step()
 
-            total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
+            # calculate moving averages
 
-        self.d_loss = float(total_disc_loss)
-        self.track(self.d_loss, 'D')
+            if apply_path_penalty and not np.isnan(avg_pl_length):
+                self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
+                self.track(self.pl_mean, 'PL')
 
-        self.GAN.D_opt.step()
+            if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
+                self.GAN.EMA()
 
-        # train generator
+            if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
+                self.GAN.reset_parameter_averaging()
 
-        self.GAN.G_opt.zero_grad()
+            # save from NaN errors
 
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[S, G, D_aug]):
-            style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-            noise = image_noise(batch_size, image_size, device=self.rank)
+            if any(torch.isnan(l) for l in (total_gen_loss, total_disc_loss)):
+                print(f'NaN detected for generator or discriminator. Loading from checkpoint #{self.checkpoint_num}')
+                self.load(self.checkpoint_num)
+                raise NanException
 
-            w_space = latent_to_w(S, style)
-            w_styles = styles_def_to_tensor(w_space)
+            # periodically save results
 
-            generated_images = G(w_styles, noise)
-            fake_output, _ = D_aug(generated_images, **aug_kwargs)
-            fake_output_loss = fake_output
+            if self.is_main:
+                if self.steps % self.save_every == 0:
+                    self.save(self.checkpoint_num)
 
-            real_output = None
-            if G_requires_reals:
-                image_batch = next(self.loader).cuda(self.rank)
-                real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
-                real_output = real_output.detach()
+                if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 2500):
+                    self.evaluate(floor(self.steps / self.evaluate_every))
 
-            if self.top_k_training:
-                epochs = (self.steps * batch_size * self.gradient_accumulate_every) / len(self.dataset)
-                k_frac = max(self.generator_top_k_gamma ** epochs, self.generator_top_k_frac)
-                k = math.ceil(batch_size * k_frac)
+                if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
+                    num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
+                    fid = self.calculate_fid(num_batches)
+                    self.last_fid = fid
 
-                if k != batch_size:
-                    fake_output_loss, _ = fake_output_loss.topk(k=k, largest=False)
+                    with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
+                        f.write(f'{self.steps},{fid}\n')
 
-            loss = G_loss_fn(fake_output_loss, real_output)
-            gen_loss = loss
-
-            if apply_path_penalty:
-                pl_lengths = calc_pl_lengths(w_styles, generated_images)
-                avg_pl_length = np.mean(pl_lengths.detach().cpu().numpy())
-
-                if not is_empty(self.pl_mean):
-                    pl_loss = ((pl_lengths - self.pl_mean) ** 2).mean()
-                    if not torch.isnan(pl_loss):
-                        gen_loss = gen_loss + pl_loss
-
-            gen_loss = gen_loss / self.gradient_accumulate_every
-            gen_loss.register_hook(raise_if_nan)
-            backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
-
-            total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
-
-        self.g_loss = float(total_gen_loss)
-        self.track(self.g_loss, 'G')
-
-        self.GAN.G_opt.step()
-
-        # calculate moving averages
-
-        if apply_path_penalty and not np.isnan(avg_pl_length):
-            self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
-            self.track(self.pl_mean, 'PL')
-
-        if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
-            self.GAN.EMA()
-
-        if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
-            self.GAN.reset_parameter_averaging()
-
-        # save from NaN errors
-
-        if any(torch.isnan(l) for l in (total_gen_loss, total_disc_loss)):
-            print(f'NaN detected for generator or discriminator. Loading from checkpoint #{self.checkpoint_num}')
-            self.load(self.checkpoint_num)
-            raise NanException
-
-        # periodically save results
-
-        if self.is_main:
-            if self.steps % self.save_every == 0:
-                self.save(self.checkpoint_num)
-
-            if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 2500):
-                self.evaluate(floor(self.steps / self.evaluate_every))
-
-            if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
-                num_batches = math.ceil(self.calculate_fid_num_images / self.batch_size)
-                fid = self.calculate_fid(num_batches)
-                self.last_fid = fid
-
-                with open(str(self.results_dir / self.name / f'fid_scores.txt'), 'a') as f:
-                    f.write(f'{self.steps},{fid}\n')
-
-        self.steps += 1
-        self.av = None
+            self.steps += 1
+            self.av = None
 
     @torch.no_grad()
     def evaluate(self, num = 0, trunc = 1.0):
