@@ -758,16 +758,14 @@ class StyleGAN2(nn.Module):
     def forward(self, x):
         return x
 
-shape_info = {}
 def pack_hook(input):
     # print("=========PACK HOOK===========")
     quantized = actnn.ops.quantize_activation(input, None)
-    shape_info[hash(quantized)] = input.shape
-    return quantized
+    return (quantized, input.shape)
 
-def unpack_hook(quantized):
+def unpack_hook(quantized_and_shape):
     # print("=========UNPACK HOOK===========")
-    input_shape = shape_info[hash(quantized)]
+    quantized, input_shape = quantized_and_shape
     return actnn.ops.dequantize_activation(quantized, input_shape)
 
 class Trainer():
